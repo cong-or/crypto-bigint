@@ -168,6 +168,126 @@ impl<const LIMBS: usize> Uint<LIMBS> {
         y
     }
 
+    /// Computes `(lo + hi * 2^Self::BITS) / rhs` for a double-width dividend, returning the
+    /// wrapped quotient and the remainder.
+    ///
+    /// The quotient of such a dividend may exceed `Self::BITS`; only its low `Self::BITS` bits are
+    /// returned (i.e. the quotient is reduced modulo `2^Self::BITS`). This is the quotient-tracking
+    /// counterpart of [`Uint::rem_wide`], and avoids widening the operands via
+    /// [`Concat`][`crate::Concat`], so it is available for any limb count.
+    ///
+    /// ### Usage:
+    /// ```
+    /// use crypto_bigint::{U256, NonZero};
+    ///
+    /// // dividend = 3 * 2^256 + 5, so dividing by 3 gives quotient 2^256 + 1, remainder 2
+    /// let lo = U256::from(5u64);
+    /// let hi = U256::from(3u64);
+    /// let rhs = NonZero::new(U256::from(3u64)).unwrap();
+    /// let (quo, rem) = U256::div_rem_wide((lo, hi), &rhs);
+    ///
+    /// // the true quotient 2^256 + 1 doesn't fit in 256 bits, so it wraps down to 1
+    /// assert_eq!(quo, U256::ONE);
+    /// assert_eq!(rem, U256::from(2u64));
+    /// ```
+    #[inline]
+    #[must_use]
+    pub const fn div_rem_wide(lower_upper: (Self, Self), rhs: &NonZero<Self>) -> (Self, Self) {
+        let (mut lo, mut hi) = lower_upper;
+        let mut y = *rhs.as_ref();
+        let mut quo = Self::ZERO;
+        UintRef::div_rem_wide(
+            (lo.as_mut_uint_ref(), hi.as_mut_uint_ref()),
+            y.as_mut_uint_ref(),
+            quo.as_mut_uint_ref(),
+        );
+        (quo, y)
+    }
+
+    /// Computes the wrapped quotient `(lo + hi * 2^Self::BITS) / rhs`, reduced modulo
+    /// `2^Self::BITS`.
+    ///
+    /// The quotient-only counterpart of [`Uint::rem_wide`]; see [`Uint::div_rem_wide`] for
+    /// details.
+    #[inline]
+    #[must_use]
+    pub const fn wrapping_div_wide(lower_upper: (Self, Self), rhs: &NonZero<Self>) -> Self {
+        Self::div_rem_wide(lower_upper, rhs).0
+    }
+
+    /// Exactly divides the double-width dividend `(lo, hi)` by `rhs`, returning the quotient if
+    /// the division is exact and [`CtOption::none()`] if `rhs` does not divide the dividend.
+    ///
+    /// When the division is exact the quotient is guaranteed to fit in `Self`, so no wrapping
+    /// occurs. This is the wide counterpart of [`Uint::div_exact`].
+    ///
+    /// ### Usage:
+    /// ```
+    /// use crypto_bigint::{U256, NonZero};
+    ///
+    /// let rhs = NonZero::new(U256::from(3u64)).unwrap();
+    ///
+    /// // 15 = 3 * 5 exactly
+    /// let quo = U256::div_wide_exact((U256::from(15u64), U256::ZERO), &rhs).unwrap();
+    /// assert_eq!(quo, U256::from(5u64));
+    ///
+    /// // 16 is not divisible by 3
+    /// let not_exact = U256::div_wide_exact((U256::from(16u64), U256::ZERO), &rhs);
+    /// assert!(bool::from(not_exact.is_none()));
+    /// ```
+    #[inline]
+    #[must_use]
+    pub const fn div_wide_exact(lower_upper: (Self, Self), rhs: &NonZero<Self>) -> CtOption<Self> {
+        let (quo, rem) = Self::div_rem_wide(lower_upper, rhs);
+        CtOption::new(quo, rem.is_zero())
+    }
+
+    /// Computes `(lo + hi * 2^Self::BITS) / rhs` for a double-width dividend, returning the
+    /// wrapped quotient and the remainder.
+    ///
+    /// This is variable-time only with respect to `rhs`. When used with a fixed `rhs`, it is
+    /// constant-time with respect to the dividend. See [`Uint::div_rem_wide`] for details.
+    #[inline]
+    #[must_use]
+    pub const fn div_rem_wide_vartime(
+        lower_upper: (Self, Self),
+        rhs: &NonZero<Self>,
+    ) -> (Self, Self) {
+        let (mut lo, mut hi) = lower_upper;
+        let mut y = *rhs.as_ref();
+        let mut quo = Self::ZERO;
+        UintRef::div_rem_wide_vartime(
+            (lo.as_mut_uint_ref(), hi.as_mut_uint_ref()),
+            y.as_mut_uint_ref(),
+            quo.as_mut_uint_ref(),
+        );
+        (quo, y)
+    }
+
+    /// Computes the wrapped quotient `(lo + hi * 2^Self::BITS) / rhs`, reduced modulo
+    /// `2^Self::BITS`.
+    ///
+    /// This is variable-time only with respect to `rhs`. See [`Uint::wrapping_div_wide`].
+    #[inline]
+    #[must_use]
+    pub const fn wrapping_div_wide_vartime(lower_upper: (Self, Self), rhs: &NonZero<Self>) -> Self {
+        Self::div_rem_wide_vartime(lower_upper, rhs).0
+    }
+
+    /// Exactly divides the double-width dividend `(lo, hi)` by `rhs`, returning the quotient if the
+    /// division is exact and [`CtOption::none()`] otherwise.
+    ///
+    /// This is variable-time only with respect to `rhs`. See [`Uint::div_wide_exact`].
+    #[inline]
+    #[must_use]
+    pub const fn div_wide_exact_vartime(
+        lower_upper: (Self, Self),
+        rhs: &NonZero<Self>,
+    ) -> CtOption<Self> {
+        let (quo, rem) = Self::div_rem_wide_vartime(lower_upper, rhs);
+        CtOption::new(quo, rem.is_zero())
+    }
+
     /// Computes `self` % 2^k. Faster than reduce since its a power of 2.
     /// Limited to 2^16-1 since Uint doesn't support higher.
     ///
@@ -544,7 +664,11 @@ mod tests {
     };
 
     #[cfg(feature = "rand_core")]
-    use {crate::Random, chacha20::ChaCha8Rng, rand_core::Rng, rand_core::SeedableRng};
+    use {
+        crate::{Random, U192, U384},
+        chacha20::ChaCha8Rng,
+        rand_core::{Rng, SeedableRng},
+    };
 
     #[test]
     fn div_word() {
@@ -997,5 +1121,141 @@ mod tests {
             y: U1024::from(456u64),
         };
         assert_eq!(a.divide_x_by_y(), U1024::from(2707385u64));
+    }
+
+    /// Check the wide-division methods (constant-time and variable-time) for a dividend
+    /// `lo + hi * 2^(L * Limb::BITS)` against the trusted `div_rem` reference, which divides the
+    /// same value widened into `Uint<W>` (with `W == 2 * L`).
+    fn check<const L: usize, const W: usize>(lo: Uint<L>, hi: Uint<L>, den: Uint<L>) {
+        let nz = den.to_nz().unwrap();
+
+        // Reference: build the wide dividend and divide it with the trusted `div_rem`.
+        let wide: Uint<W> = lo.concat_resize(&hi);
+        let (full_q, full_r) = wide.div_rem(&den.resize::<W>().to_nz().unwrap());
+        let exp_q = full_q.resize::<L>();
+        let exp_r = full_r.resize::<L>();
+        let exact = exp_r == Uint::<L>::ZERO;
+
+        // Both the constant-time and variable-time paths must match the reference.
+        for (q, r) in [
+            Uint::<L>::div_rem_wide((lo, hi), &nz),
+            Uint::<L>::div_rem_wide_vartime((lo, hi), &nz),
+        ] {
+            assert_eq!(q, exp_q, "div_rem_wide quotient: ({lo}, {hi}) / {den}");
+            assert_eq!(r, exp_r, "div_rem_wide remainder: ({lo}, {hi}) / {den}");
+        }
+        assert_eq!(Uint::<L>::wrapping_div_wide((lo, hi), &nz), exp_q);
+        assert_eq!(Uint::<L>::wrapping_div_wide_vartime((lo, hi), &nz), exp_q);
+
+        for maybe_quo in [
+            Uint::<L>::div_wide_exact((lo, hi), &nz),
+            Uint::<L>::div_wide_exact_vartime((lo, hi), &nz),
+        ] {
+            assert_eq!(bool::from(maybe_quo.is_some()), exact);
+            if exact {
+                assert_eq!(maybe_quo.unwrap(), exp_q);
+            }
+        }
+    }
+
+    #[test]
+    fn div_rem_wide_edge() {
+        let two_127 = U128::from_be_hex("80000000000000000000000000000000"); // 2^127
+
+        // Boundary cases, each checked against the concat + `div_rem` reference.
+        for (lo, hi, den) in [
+            (U128::ZERO, U128::ZERO, U128::from(7u64)), // both halves zero
+            (U128::from(100u64), U128::ZERO, U128::from(7u64)), // high half zero
+            (U128::ZERO, U128::ONE, U128::ONE),         // divisor 1: quotient wraps
+            (U128::MAX, U128::MAX, U128::MAX),          // 2^128 + 1 wraps to 1
+            (U128::MAX, U128::ZERO, U128::from(2u64)),  // half-word divisor
+            (two_127, U128::ONE, U128::from(3u64)),     // 3 * 2^127, single-word divisor
+        ] {
+            check::<{ U128::LIMBS }, { U256::LIMBS }>(lo, hi, den);
+        }
+        // Single-word operands (LIMBS == 1).
+        for (lo, hi, den) in [
+            (U64::MAX, U64::MAX, U64::MAX),
+            (U64::from(5u64), U64::from(9u64), U64::from(4u64)),
+        ] {
+            check::<{ U64::LIMBS }, { U128::LIMBS }>(lo, hi, den);
+        }
+
+        // A couple of hand-computed values for extra confidence.
+        // (2^256 - 1) / (2^128 - 1) = 2^128 + 1, wrapped mod 2^128 = 1, remainder 0.
+        let (q, r) = U128::div_rem_wide((U128::MAX, U128::MAX), &U128::MAX.to_nz().unwrap());
+        assert_eq!(q, U128::ONE);
+        assert_eq!(r, U128::ZERO);
+
+        // 3 * 2^127 = 2^128 + 2^127 => hi = 1, lo = 2^127; the exact quotient is 2^127.
+        let three = U128::from(3u64).to_nz().unwrap();
+        let (q, r) = U128::div_rem_wide((two_127, U128::ONE), &three);
+        assert_eq!(q, two_127);
+        assert_eq!(r, U128::ZERO);
+        assert_eq!(
+            U128::div_wide_exact((two_127, U128::ONE), &three).unwrap(),
+            two_127
+        );
+    }
+
+    /// Force a randomly generated value to be non-zero so it is a valid divisor.
+    #[cfg(feature = "rand_core")]
+    fn nz<const L: usize>(v: Uint<L>) -> Uint<L> {
+        if bool::from(v.is_zero()) {
+            Uint::ONE
+        } else {
+            v
+        }
+    }
+
+    #[cfg(feature = "rand_core")]
+    #[test]
+    fn div_rem_wide_vs_concat() {
+        let mut rng = ChaCha8Rng::from_seed([9u8; 32]);
+        for _ in 0..300 {
+            // Single-word path (U64 operands).
+            let lo64 = U64::random_from_rng(&mut rng);
+            let hi64 = U64::random_from_rng(&mut rng);
+            check::<{ U64::LIMBS }, { U128::LIMBS }>(
+                lo64,
+                hi64,
+                nz(U64::random_from_rng(&mut rng)),
+            );
+
+            // Multi-limb path (U128): a full-width divisor, then a single-word-value divisor
+            // (ywords == 1, which hits the div2by1 correction).
+            let lo = U128::random_from_rng(&mut rng);
+            let hi = U128::random_from_rng(&mut rng);
+            check::<{ U128::LIMBS }, { U256::LIMBS }>(lo, hi, nz(U128::random_from_rng(&mut rng)));
+            let d_small = U64::random_from_rng(&mut rng).resize::<{ U128::LIMBS }>();
+            check::<{ U128::LIMBS }, { U256::LIMBS }>(lo, hi, nz(d_small));
+
+            // Odd limb count (U192): a full-width divisor (>= 3 significant limbs, so the tail
+            // `done` masking / vartime early-break fires) and a narrower divisor.
+            let lo192 = U192::random_from_rng(&mut rng);
+            let hi192 = U192::random_from_rng(&mut rng);
+            check::<{ U192::LIMBS }, { U384::LIMBS }>(
+                lo192,
+                hi192,
+                nz(U192::random_from_rng(&mut rng)),
+            );
+            let d192_narrow = U128::random_from_rng(&mut rng).resize::<{ U192::LIMBS }>();
+            check::<{ U192::LIMBS }, { U384::LIMBS }>(lo192, hi192, nz(d192_narrow));
+
+            // Wider operands (U256): a full-width divisor, a single-word-value divisor, and one
+            // with exactly LIMBS-1 significant limbs (fires the vartime early-break while the
+            // divisor is still narrower than the dividend's high half).
+            let lo256 = U256::random_from_rng(&mut rng);
+            let hi256 = U256::random_from_rng(&mut rng);
+            check::<{ U256::LIMBS }, { U512::LIMBS }>(
+                lo256,
+                hi256,
+                nz(U256::random_from_rng(&mut rng)),
+            );
+            let d256_narrow = U128::random_from_rng(&mut rng).resize::<{ U256::LIMBS }>();
+            check::<{ U256::LIMBS }, { U512::LIMBS }>(lo256, hi256, nz(d256_narrow));
+            let d256_3limb = U192::random_from_rng(&mut rng).resize::<{ U256::LIMBS }>();
+            check::<{ U256::LIMBS }, { U512::LIMBS }>(lo256, hi256, nz(d256_3limb));
+        }
     }
 }
