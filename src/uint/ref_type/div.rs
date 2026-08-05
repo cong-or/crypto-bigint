@@ -205,7 +205,8 @@ impl UintRef {
     }
 
     /// Computes `x_lower_upper` / `rhs`, returning the wrapped quotient in `quo` and the
-    /// remainder in `rhs`.
+    /// remainder in `rhs`. Returns a [`Choice`] that is truthy when the quotient fit in `quo`
+    /// without truncation.
     ///
     /// The `x_lower_upper` tuple represents a wide (double-width) dividend `x_lo + x_hi * B`,
     /// where `B = 2^(x_lo.bits_precision())`. The size of `x_lower_upper.1` and of `quo` must each
@@ -218,13 +219,17 @@ impl UintRef {
     /// # Panics
     /// If the divisor is zero.
     #[inline(always)]
-    pub(crate) const fn div_rem_wide(
+    pub(crate) const fn wrapping_div_rem_wide(
         x_lower_upper: (&mut Self, &mut Self),
         rhs: &mut Self,
         quo: &mut Self,
-    ) {
+    ) -> Choice {
         let (x_lo, x) = x_lower_upper;
         let y = rhs;
+
+        // The retained low half of the quotient is the whole quotient exactly when the true
+        // quotient is below `B`, which happens iff the high half of the dividend is `< rhs`.
+        let fits = UintRef::lt(x, y);
 
         // Short circuit for single-word divisor (only reachable when the operands are one limb
         // wide, since `div3by2` in the main path requires a two-limb divisor).
@@ -244,7 +249,7 @@ impl UintRef {
 
             quo.limbs[0] = x_lo.limbs[0];
             y.limbs[0] = hi.shr(sh);
-            return;
+            return fits;
         }
 
         // Compute the size of the divisor
@@ -263,10 +268,12 @@ impl UintRef {
         x.limbs[0] = x.limbs[0].bitor(x_lo_carry);
 
         // Perform the core division algorithm
-        Self::div_rem_wide_shifted((x_lo, x), x_hi, y, ywords, quo);
+        Self::wrapping_div_rem_wide_shifted((x_lo, x), x_hi, y, ywords, quo);
 
         // Unshift the remainder from the earlier adjustment
         y.shr_assign_limb(lshift);
+
+        fits
     }
 
     /// Computes `x_lower_upper` / `rhs`, returning the wrapped quotient in `quo` and the
@@ -277,18 +284,24 @@ impl UintRef {
     ///
     /// The `x_lower_upper` tuple represents a wide (double-width) dividend. The size of
     /// `x_lower_upper.1` and of `quo` must each be at least as large as `rhs`. `x_lower_upper` is
-    /// left in an indeterminate state. See [`UintRef::div_rem_wide`] for the wrapping semantics.
+    /// left in an indeterminate state. See [`UintRef::wrapping_div_rem_wide`] for the wrapping
+    /// semantics and the returned [`Choice`].
     ///
     /// # Panics
     /// If the divisor is zero.
     #[inline(always)]
-    pub(crate) const fn div_rem_wide_vartime(
+    pub(crate) const fn wrapping_div_rem_wide_vartime(
         x_lower_upper: (&mut Self, &mut Self),
         rhs: &mut Self,
         quo: &mut Self,
-    ) {
+    ) -> Choice {
         let (x_lo, x) = x_lower_upper;
         let xsize = x.nlimbs();
+
+        // The retained low half of the quotient is the whole quotient exactly when the high half
+        // of the dividend is `< rhs` (see `wrapping_div_rem_wide`).
+        let fits = UintRef::lt(x, rhs);
+
         let ysize = bitlen::to_limbs(rhs.bits_vartime());
         let y = rhs.leading_mut(ysize);
 
@@ -298,7 +311,7 @@ impl UintRef {
                 // Empty dividend: both quotient and remainder are zero.
                 y.fill(Limb::ZERO);
                 quo.fill(Limb::ZERO);
-                return;
+                return fits;
             }
             (_, 1) => {
                 // Single-word divisor: long division by one limb, most-significant limb first,
@@ -326,7 +339,7 @@ impl UintRef {
                 quo.copy_from(x_lo);
                 y.fill(Limb::ZERO);
                 y.limbs[0] = hi.shr(sh);
-                return;
+                return fits;
             }
             _ if ysize > xsize => {
                 panic!("divisor too large");
@@ -349,7 +362,7 @@ impl UintRef {
         let reciprocal = Reciprocal::new(y.limbs[ysize - 1].to_nz().expect_copied("zero divisor"));
 
         // Perform the core division algorithm
-        x_hi = Self::div_rem_wide_large_shifted::<true>(
+        x_hi = Self::wrapping_div_rem_wide_large_shifted::<true>(
             (x_lo, x),
             x_hi,
             y,
@@ -367,6 +380,8 @@ impl UintRef {
 
         // Unshift the remainder from the earlier adjustment
         y.shr_assign_limb_vartime(lshift);
+
+        fits
     }
 
     /// Conditionally shift the limbs one position toward the most-significant end, dropping the
@@ -377,11 +392,8 @@ impl UintRef {
     /// low `self.nlimbs()` limbs of the full-width quotient.
     #[inline(always)]
     const fn shift_in_limb(&mut self, limb: Limb, shift: Choice) {
-        let mut j = self.nlimbs();
-        while j > 1 {
-            j -= 1;
-            self.limbs[j] = Limb::select(self.limbs[j], self.limbs[j - 1], shift);
-        }
+        // Shift the limbs up by one, inserting a zero at the bottom, then overwrite it with `limb`.
+        self.conditional_shl_assign_by_limbs_vartime(1, shift);
         if self.nlimbs() > 0 {
             self.limbs[0] = Limb::select(self.limbs[0], limb, shift);
         }
@@ -397,7 +409,7 @@ impl UintRef {
     /// be unshifted by the caller). `x` is left in an indeterminate state.
     #[inline(always)]
     #[allow(clippy::cast_possible_truncation)]
-    const fn div_rem_wide_shifted(
+    const fn wrapping_div_rem_wide_shifted(
         x: (&mut Self, &mut Self),
         mut x_hi: Limb,
         y: &mut Self,
@@ -412,8 +424,14 @@ impl UintRef {
         debug_assert!(reciprocal.shift() == 0);
 
         // Perform the core division algorithm
-        x_hi =
-            Self::div_rem_wide_large_shifted::<false>((x_lo, x), x_hi, y, ywords, reciprocal, quo);
+        x_hi = Self::wrapping_div_rem_wide_large_shifted::<false>(
+            (x_lo, x),
+            x_hi,
+            y,
+            ywords,
+            reciprocal,
+            quo,
+        );
 
         // Calculate quotient and remainder for the case where the divisor is a single word.
         let limb_div = Choice::from_u32_eq(1, ywords);
@@ -451,7 +469,7 @@ impl UintRef {
     /// high bit of the divisor is set, and `x_hi` holds the top bits of the dividend.
     #[inline(always)]
     #[allow(clippy::cast_possible_truncation)]
-    const fn div_rem_wide_large_shifted<const VARTIME: bool>(
+    const fn wrapping_div_rem_wide_large_shifted<const VARTIME: bool>(
         x: (&Self, &mut Self),
         mut x_hi: Limb,
         y: &Self,
@@ -461,7 +479,7 @@ impl UintRef {
     ) -> Limb {
         assert!(
             y.nlimbs() <= x.1.nlimbs(),
-            "invalid input sizes for div_rem_wide_large_shifted"
+            "invalid input sizes for wrapping_div_rem_wide_large_shifted"
         );
 
         let (x_lo, x) = x;
